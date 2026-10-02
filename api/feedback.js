@@ -127,6 +127,20 @@ export default async function handler(req, res) {
       vocabulary: clamp(out.scores?.vocabulary),
       communicativeCompetence: clamp(out.scores?.communicativeCompetence),
     };
+    if (words >= 3 && Object.values(out.scores).every((score) => score === 0)) {
+      const rescorePrompt = `Act as an SPM 1119/3 speaking assessor. The transcript below contains ${words} English words, so do not award all zero unless it is genuinely unintelligible or unrelated. Give a cautious rough score from 0 to 6 for each official criterion. Use 1 for very limited language, 3 for generally relevant simple language, 5 for developed language with good control, and 6 only for consistently strong performance. Return ONLY JSON in exactly this format: {"overall":0,"grammar":0,"vocabulary":0,"communicativeCompetence":0}.\nTask: ${body.prompt}\nTranscript: ${transcript}`;
+      try {
+        const rescored = parseModelJson(await groqChat(rescorePrompt, true, 250));
+        out.scores = {
+          overall: clamp(rescored.overall),
+          grammar: clamp(rescored.grammar),
+          vocabulary: clamp(rescored.vocabulary),
+          communicativeCompetence: clamp(rescored.communicativeCompetence),
+        };
+      } catch {
+        // Keep the cautious first result if the dedicated re-score also fails.
+      }
+    }
     out.total = Object.values(out.scores).reduce((sum, score) => sum + score, 0);
     out.transcript = transcript;
     out.metrics = { words, wpm, duration: body.duration };
