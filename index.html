@@ -1,82 +1,368 @@
-begin;
-create extension if not exists pgcrypto;
-
-create table if not exists public.profiles(
-  id uuid primary key references auth.users(id) on delete cascade,
-  full_name text not null default '',
-  role text not null default 'student' check(role in('student','teacher')),
-  created_at timestamptz not null default now()
-);
-create table if not exists public.classes(
-  id uuid primary key default gen_random_uuid(),
-  name text not null,
-  code text not null unique check(code=upper(code)),
-  teacher_id uuid not null references public.profiles(id) on delete cascade,
-  created_at timestamptz not null default now()
-);
-create table if not exists public.class_members(
-  class_id uuid not null references public.classes(id) on delete cascade,
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  role text not null check(role in('student','teacher')),
-  joined_at timestamptz not null default now(),
-  primary key(class_id,user_id)
-);
-create table if not exists public.assignments(
-  id uuid primary key default gen_random_uuid(),class_id uuid not null references public.classes(id) on delete cascade,
-  teacher_id uuid not null references public.profiles(id),title text not null,part text not null check(part in('part1','part2','part3')),
-  topic text not null,prompt text not null,due_at timestamptz,created_at timestamptz not null default now()
-);
-create table if not exists public.attempts(
-  id bigint generated always as identity primary key,user_id uuid not null references public.profiles(id) on delete cascade,
-  class_id uuid references public.classes(id) on delete set null,assignment_id uuid references public.assignments(id) on delete set null,
-  student_name text not null,part text not null check(part in('part1','part2','part3')),topic text not null,prompt text not null,
-  duration_seconds integer not null default 0,total_score smallint not null check(total_score between 0 and 24),
-  overall_score smallint not null check(overall_score between 0 and 6),grammar_score smallint not null check(grammar_score between 0 and 6),
-  vocabulary_score smallint not null check(vocabulary_score between 0 and 6),communication_score smallint not null check(communication_score between 0 and 6),
-  ai_feedback jsonb not null default '{}'::jsonb,diagnostic_type text check(diagnostic_type in('pre','post')),recording_path text,
-  created_at timestamptz not null default now()
-);
-create table if not exists public.teacher_feedback(
-  id bigint generated always as identity primary key,attempt_id bigint not null unique references public.attempts(id) on delete cascade,
-  teacher_id uuid not null references public.profiles(id) on delete cascade,comment text not null,created_at timestamptz not null default now(),updated_at timestamptz not null default now()
-);
-
-create index if not exists attempts_user_idx on public.attempts(user_id);
-create index if not exists attempts_class_idx on public.attempts(class_id);
-create index if not exists members_user_idx on public.class_members(user_id);
-
-create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$
-begin insert into public.profiles(id,full_name,role) values(new.id,coalesce(new.raw_user_meta_data->>'full_name',''),coalesce(new.raw_user_meta_data->>'role','student'));return new;end$$;
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
-
-create or replace function public.is_class_teacher(p_class uuid) returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from public.class_members where class_id=p_class and user_id=(select auth.uid()) and role='teacher')$$;
-create or replace function public.is_class_member(p_class uuid) returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from public.class_members where class_id=p_class and user_id=(select auth.uid()))$$;
-create or replace function public.create_or_get_class(p_code text,p_name text) returns uuid language plpgsql security definer set search_path=public as $$declare cid uuid;begin if not exists(select 1 from public.profiles where id=(select auth.uid()) and role='teacher') then raise exception 'Teacher account required';end if;insert into public.classes(name,code,teacher_id) values(coalesce(nullif(trim(p_name),''),upper(trim(p_code))),upper(trim(p_code)),(select auth.uid())) on conflict(code) do update set code=excluded.code where classes.teacher_id=(select auth.uid()) returning id into cid;if cid is null then raise exception 'Class code already belongs to another teacher';end if;insert into public.class_members(class_id,user_id,role) values(cid,(select auth.uid()),'teacher') on conflict do nothing;return cid;end$$;
-create or replace function public.join_class_by_code(p_code text) returns uuid language plpgsql security definer set search_path=public as $$declare cid uuid;begin select id into cid from public.classes where code=upper(trim(p_code));if cid is null then raise exception 'Class code not found';end if;insert into public.class_members(class_id,user_id,role) values(cid,(select auth.uid()),'student') on conflict do nothing;return cid;end$$;
-
-alter table public.profiles enable row level security;alter table public.classes enable row level security;alter table public.class_members enable row level security;alter table public.assignments enable row level security;alter table public.attempts enable row level security;alter table public.teacher_feedback enable row level security;
-revoke all on public.profiles,public.classes,public.class_members,public.assignments,public.attempts,public.teacher_feedback from anon;
-grant select,update on public.profiles to authenticated;grant select,insert,update,delete on public.classes,public.class_members,public.assignments,public.attempts,public.teacher_feedback to authenticated;
-grant execute on function public.create_or_get_class(text,text),public.join_class_by_code(text) to authenticated;
-
-create policy profiles_self_select on public.profiles for select to authenticated using(id=(select auth.uid()) or exists(select 1 from public.class_members m join public.class_members me on me.class_id=m.class_id where m.user_id=profiles.id and me.user_id=(select auth.uid()) and me.role='teacher'));
-create policy profiles_self_update on public.profiles for update to authenticated using(id=(select auth.uid())) with check(id=(select auth.uid()));
-create policy classes_member_select on public.classes for select to authenticated using(public.is_class_member(id));
-create policy members_class_select on public.class_members for select to authenticated using(user_id=(select auth.uid()) or public.is_class_teacher(class_id));
-create policy assignments_member_select on public.assignments for select to authenticated using(public.is_class_member(class_id));
-create policy assignments_teacher_insert on public.assignments for insert to authenticated with check(teacher_id=(select auth.uid()) and public.is_class_teacher(class_id));
-create policy assignments_teacher_update on public.assignments for update to authenticated using(teacher_id=(select auth.uid()) and public.is_class_teacher(class_id));
-create policy assignments_teacher_delete on public.assignments for delete to authenticated using(teacher_id=(select auth.uid()) and public.is_class_teacher(class_id));
-create policy attempts_select on public.attempts for select to authenticated using(user_id=(select auth.uid()) or (class_id is not null and public.is_class_teacher(class_id)));
-create policy attempts_insert on public.attempts for insert to authenticated with check(user_id=(select auth.uid()) and (class_id is null or public.is_class_member(class_id)));
-create policy attempts_owner_delete on public.attempts for delete to authenticated using(user_id=(select auth.uid()));
-create policy feedback_select on public.teacher_feedback for select to authenticated using(teacher_id=(select auth.uid()) or exists(select 1 from public.attempts a where a.id=attempt_id and a.user_id=(select auth.uid())));
-create policy feedback_teacher_insert on public.teacher_feedback for insert to authenticated with check(teacher_id=(select auth.uid()) and exists(select 1 from public.attempts a where a.id=attempt_id and public.is_class_teacher(a.class_id)));
-create policy feedback_teacher_update on public.teacher_feedback for update to authenticated using(teacher_id=(select auth.uid())) with check(teacher_id=(select auth.uid()));
-
-insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types) values('recordings','recordings',false,12582912,array['audio/webm','audio/ogg','audio/mp4']) on conflict(id) do update set public=false,file_size_limit=excluded.file_size_limit,allowed_mime_types=excluded.allowed_mime_types;
-create policy recordings_student_insert on storage.objects for insert to authenticated with check(bucket_id='recordings' and (storage.foldername(name))[2]=(select auth.uid())::text);
-create policy recordings_read on storage.objects for select to authenticated using(bucket_id='recordings' and ((storage.foldername(name))[2]=(select auth.uid())::text or public.is_class_teacher(((storage.foldername(name))[1])::uuid)));
-create policy recordings_student_delete on storage.objects for delete to authenticated using(bucket_id='recordings' and (storage.foldername(name))[2]=(select auth.uid())::text);
-commit;
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>SpeakBuddy SPM</title>
+    <meta
+      name="description"
+      content="AI-assisted SPM English speaking practice for Malaysian students."
+    />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230b3b66'/%3E%3Cpath d='M13 16h38v25H31l-11 9v-9h-7z' fill='%23ffc857'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/cloud.css" />
+  </head>
+  <body>
+    <div id="login" class="login-screen">
+      <section class="login-card">
+        <div class="logo">
+          <span>SB</span>
+          <div>
+            <strong>SpeakBuddy SPM</strong
+            ><small>Practise. Improve. Speak confidently.</small>
+          </div>
+        </div>
+        <div class="welcome-art" aria-hidden="true">
+          <div>🎙️</div>
+          <div>💬</div>
+          <div>📈</div>
+        </div>
+        <h1>Welcome, speaker!</h1>
+        <p>Sign in to keep your progress securely across devices.</p>
+        <label
+          >Your name <small>(needed when creating an account)</small
+          ><input id="login-name" placeholder="e.g. Aina" /></label
+        ><label
+          >Email<input
+            id="login-email"
+            type="email"
+            autocomplete="email"
+            placeholder="student@example.com" /></label
+        ><label
+          >Password<input
+            id="login-password"
+            type="password"
+            autocomplete="current-password"
+            minlength="8"
+            placeholder="At least 8 characters"
+        /></label>
+        <div class="login-row">
+          <label
+            >Account type<select id="login-role">
+              <option value="student">Student</option>
+              <option value="teacher">Teacher</option>
+            </select></label
+          ><label
+            >Class code<input id="login-class" placeholder="e.g. 5MAJU"
+          /></label>
+        </div>
+        <label class="consent"
+          ><input id="consent" type="checkbox" /> I consent to recording my
+          voice for practice. Recordings are uploaded privately only when I
+          request AI feedback.</label
+        >
+        <div class="login-actions">
+          <button id="enter-app" class="btn primary">Sign in</button
+          ><button id="create-account" class="btn soft">Create account</button>
+        </div>
+        <p id="auth-status" class="privacy-note"></p>
+      </section>
+    </div>
+    <div id="app" class="app-shell" hidden>
+      <aside class="sidebar">
+        <div class="logo light">
+          <span>SB</span>
+          <div><strong>SpeakBuddy</strong><small>SPM 1119/3</small></div>
+        </div>
+        <nav>
+          <button class="nav active" data-view="home">
+            🏠 <span>Home</span></button
+          ><button class="nav" data-view="practice">
+            🎙️ <span>Practice</span></button
+          ><button class="nav" data-view="diagnostic">
+            🩺 <span>Diagnostic</span></button
+          ><button class="nav" data-view="progress">
+            📊 <span>Progress</span></button
+          ><button class="nav" data-view="teacher">
+            👩‍🏫 <span>Teacher</span>
+          </button>
+        </nav>
+        <div class="side-tools">
+          <button id="lang-toggle" class="mini-btn">BM instructions</button
+          ><button id="text-toggle" class="mini-btn">Larger text</button
+          ><button id="logout" class="mini-btn">Sign out</button>
+        </div>
+      </aside>
+      <main>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">SPM English Speaking Test</p>
+            <h1 id="view-title">Hello, speaker!</h1>
+          </div>
+          <div class="profile">
+            <span id="streak-chip">🔥 0-day streak</span>
+            <div class="avatar" id="avatar">S</div>
+            <div>
+              <strong id="profile-name">Student</strong
+              ><small id="profile-class">No class</small>
+            </div>
+          </div>
+        </header>
+        <section id="home" class="view active">
+          <div class="hero-card">
+            <div>
+              <span class="pill">Today’s speaking challenge</span>
+              <h2>Turn your ideas into confident English.</h2>
+              <p>
+                Complete one SPM-style practice, review your AI feedback, and
+                improve one thing at a time.
+              </p>
+              <button class="btn gold" data-go="practice">
+                Start today’s challenge →
+              </button>
+            </div>
+            <div class="speech-visual">
+              <div class="mic">🎤</div>
+              <div class="wave"><i></i><i></i><i></i><i></i><i></i></div>
+              <small
+                >Clear ideas · Relevant language · Active interaction</small
+              >
+            </div>
+          </div>
+          <div class="stat-grid" id="home-stats"></div>
+          <h2 class="section-title">Choose a practice mode</h2>
+          <div class="mode-grid">
+            <button class="mode-card" data-part="part1">
+              <span>👋</span>
+              <div>
+                <b>Part 1: Interview</b
+                ><small>Personal questions · 3–4 minutes</small>
+              </div></button
+            ><button class="mode-card" data-part="part2">
+              <span>🗣️</span>
+              <div>
+                <b>Part 2: Long turn</b
+                ><small>20s preparation · 1 minute speaking</small>
+              </div></button
+            ><button class="mode-card" data-part="part3">
+              <span>🤝</span>
+              <div>
+                <b>Part 3: Discussion</b
+                ><small>20s preparation · discuss and decide</small>
+              </div>
+            </button>
+          </div>
+          <div class="info-strip">
+            <span>💡</span>
+            <div>
+              <b>Point–Reason–Example</b>
+              <p>
+                State your point, explain why, and support it with an example.
+              </p>
+            </div>
+          </div>
+        </section>
+        <section id="practice" class="view">
+          <div class="practice-toolbar">
+            <label
+              >Test part<select id="part-select">
+                <option value="part1">Part 1 — Interview</option>
+                <option value="part2" selected>
+                  Part 2 — Individual long turn
+                </option>
+                <option value="part3">Part 3 — Pair discussion</option>
+              </select></label
+            ><label>Topic<select id="topic-select"></select></label
+            ><label
+              >Difficulty<select id="difficulty">
+                <option>Beginner</option>
+                <option selected>Intermediate</option>
+                <option>Advanced</option>
+              </select></label
+            >
+          </div>
+          <div class="practice-grid">
+            <article class="card task-card">
+              <div class="task-head">
+                <span class="pill" id="part-label"></span
+                ><button id="random-task" class="icon-btn">↻</button>
+              </div>
+              <h2 id="task-question"></h2>
+              <div id="discussion-points" class="point-map"></div>
+              <div class="format-box" id="format-box"></div>
+              <div class="support-tabs">
+                <button class="support-tab active" data-panel="phrases">
+                  Useful phrases</button
+                ><button class="support-tab" data-panel="ideas">
+                  Ideas & vocabulary</button
+                ><button class="support-tab" data-panel="sample">
+                  Sample answer</button
+                ><button class="support-tab" data-panel="aihelp">
+                  AI assistant
+                </button>
+              </div>
+              <div id="support-content" class="support-content"></div>
+            </article>
+            <aside class="card timer-card">
+              <span class="timer-icon">⏱️</span
+              ><small id="timer-stage">Preparation</small>
+              <div id="timer" class="timer">00:20</div>
+              <div class="timer-track"><span id="timer-bar"></span></div>
+              <p id="timer-note"></p>
+              <div class="button-row">
+                <button id="timer-start" class="btn gold">Start sequence</button
+                ><button id="timer-reset" class="btn soft">Reset</button>
+              </div>
+              <div class="sequence" id="sequence"></div>
+            </aside>
+          </div>
+          <div class="record-grid">
+            <article class="card recorder-card">
+              <div class="card-title">
+                <span>🎙️</span>
+                <div>
+                  <h2>Record your response</h2>
+                  <p>
+                    Your recording is uploaded only when you request AI
+                    feedback.
+                  </p>
+                </div>
+              </div>
+              <div class="recording-zone">
+                <button id="record-btn" class="record-btn">●</button>
+                <div>
+                  <strong id="record-status">Ready to record</strong
+                  ><small id="record-time">00:00</small>
+                </div>
+                <div class="live-wave" id="live-wave">
+                  <i></i><i></i><i></i><i></i><i></i><i></i>
+                </div>
+              </div>
+              <audio id="audio-playback" controls hidden></audio>
+              <div class="button-row">
+                <button id="download-audio" class="btn soft" disabled>
+                  Download recording</button
+                ><button id="delete-audio" class="btn soft" disabled>
+                  Delete</button
+                ><button id="ai-score" class="btn primary" disabled>
+                  ✨ Get AI feedback
+                </button>
+              </div>
+              <div id="ai-loading" class="loading" hidden>
+                <span></span> Analysing your response…
+              </div>
+            </article>
+            <article class="card notes-card">
+              <h2>Planning notes</h2>
+              <p class="muted">
+                Use keywords only. Avoid memorising a complete script.
+              </p>
+              <textarea
+                id="practice-notes"
+                placeholder="Point 1…&#10;Reason…&#10;Example…"
+              ></textarea>
+              <div class="pre-framework">
+                <b>P</b><span>Point</span><b>R</b><span>Reason</span><b>E</b
+                ><span>Example</span>
+              </div>
+            </article>
+          </div>
+          <article
+            id="feedback-card"
+            class="card feedback-card"
+            hidden
+          ></article>
+        </section>
+        <section id="diagnostic" class="view">
+          <div class="page-intro">
+            <div class="big-icon">🩺</div>
+            <div>
+              <h2>Diagnostic speaking check</h2>
+              <p>
+                Establish a baseline, then repeat the test later to measure
+                improvement.
+              </p>
+            </div>
+          </div>
+          <div class="diagnostic-grid">
+            <article class="card">
+              <span class="pill">Pre-test</span>
+              <h3>Establish your starting score</h3>
+              <p>Use the same Part 2 test conditions.</p>
+              <button class="btn primary" id="start-pre">Start pre-test</button>
+              <div id="pre-result" class="mini-result"></div>
+            </article>
+            <article class="card">
+              <span class="pill green">Post-test</span>
+              <h3>Measure your improvement</h3>
+              <p>Repeat after your practice period.</p>
+              <button class="btn primary" id="start-post">
+                Start post-test
+              </button>
+              <div id="post-result" class="mini-result"></div>
+            </article>
+          </div>
+          <article class="card">
+            <h3>Pre-test and post-test comparison</h3>
+            <div id="diagnostic-chart" class="bar-chart"></div>
+          </article>
+        </section>
+        <section id="progress" class="view">
+          <div class="stat-grid" id="progress-stats"></div>
+          <div class="two-col">
+            <article class="card">
+              <h2>Score trend</h2>
+              <div id="trend-chart" class="trend-chart"></div>
+            </article>
+            <article class="card">
+              <h2>Criterion improvement</h2>
+              <div id="criteria-chart"></div>
+            </article>
+          </div>
+          <article class="card">
+            <div class="card-row">
+              <div>
+                <h2>Saved attempts and feedback</h2>
+                <p class="muted">
+                  Review practice history and teacher comments.
+                </p>
+              </div>
+              <button id="clear-history" class="btn soft">
+                Clear my history
+              </button>
+            </div>
+            <div id="attempt-list"></div>
+          </article>
+        </section>
+        <section id="teacher" class="view">
+          <div class="teacher-hero">
+            <div>
+              <span class="pill">Cloud class dashboard</span>
+              <h2>Class <span id="teacher-class"></span></h2>
+              <p>
+                Review attempts, add feedback, and export research evidence.
+              </p>
+            </div>
+            <div class="teacher-actions">
+              <button id="export-csv" class="btn gold">Export CSV</button
+              ><button id="print-report" class="btn soft">Print / PDF</button>
+            </div>
+          </div>
+          <div class="stat-grid" id="teacher-stats"></div>
+          <article class="card">
+            <h2>Student practice evidence</h2>
+            <div id="teacher-table"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+    <div id="toast" role="status"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="/cloud.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
