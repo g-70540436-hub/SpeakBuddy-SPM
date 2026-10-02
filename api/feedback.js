@@ -21,6 +21,10 @@ async function authenticated(req) {
 }
 
 async function groqChat(prompt, jsonMode = false, maxTokens = 900) {
+  const configuredModel = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+  const model = configuredModel === "llama-3.3-70b-versatile"
+    ? "openai/gpt-oss-20b"
+    : configuredModel;
   const response = await fetch(
     "https://api.groq.com/openai/v1/chat/completions",
     {
@@ -30,11 +34,10 @@ async function groqChat(prompt, jsonMode = false, maxTokens = 900) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: process.env.GROQ_MODEL || "openai/gpt-oss-20b",
+        model,
         messages: [{ role: "user", content: prompt }],
         max_completion_tokens: maxTokens,
         temperature: jsonMode ? 0.2 : 0.5,
-        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
       }),
     },
   );
@@ -42,6 +45,18 @@ async function groqChat(prompt, jsonMode = false, maxTokens = 900) {
   if (!response.ok)
     throw Error(data.error?.message || "Groq AI request failed");
   return data.choices?.[0]?.message?.content || "";
+}
+
+function parseModelJson(text) {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/gi, "");
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start < 0 || end <= start) throw Error("AI returned an invalid score format");
+    return JSON.parse(cleaned.slice(start, end + 1));
+  }
 }
 
 export default async function handler(req, res) {
@@ -93,8 +108,18 @@ export default async function handler(req, res) {
     const wpm = Math.round(words / Math.max(1, body.duration / 60));
     const rubric = `Score only these SPM 1119/3 areas from 0 to 6 points each, without calling them bands: Overall Spoken Performance, Grammar, Vocabulary, Communicative Competence. Apply this scale: 0 insufficient English; 1 basic familiar-topic language requiring support; 3 generally relevant simple interaction with reasonable accuracy; 5 developed relevant interaction with good control and range; 6 sustained detailed interaction with consistently strong accuracy and range. Scores 2 and 4 are between descriptors. In Part 3, do not invent partner interaction evidence.`;
     const prompt = `${rubric}\nPart: ${body.part}. Difficulty: ${body.difficulty}. Question: ${body.prompt}. Required points: ${(body.points || []).join("; ")}. Duration: ${body.duration}s. Approximate rate: ${wpm} words per minute. Transcript: ${transcript || "[no usable transcript]"}. Return ONLY valid JSON: {"scores":{"overall":0,"grammar":0,"vocabulary":0,"communicativeCompetence":0},"strengths":["",""],"improvements":["",""],"pronunciation":"","fluency":"","content":"","organisation":"","confidence":"","improvedResponse":""}. Keep feedback concise and student-friendly. Pronunciation comments must be cautious because they are inferred from transcription clarity. The improved response should be 80–150 words.`;
-    const raw = await groqChat(prompt, true, 900);
-    const out = JSON.parse(raw.trim().replace(/^```json\s*|\s*```$/g, ""));
+    let raw = await groqChat(prompt, true, 900);
+    let out;
+    try {
+      out = parseModelJson(raw);
+    } catch {
+      raw = await groqChat(
+        `Convert the following content into ONLY the valid JSON object requested. Do not add markdown or explanations.\n\n${raw}`,
+        true,
+        900,
+      );
+      out = parseModelJson(raw);
+    }
 
     out.scores = {
       overall: clamp(out.scores?.overall),
