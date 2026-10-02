@@ -31,8 +31,8 @@ The SQL creates the tables, private `recordings` bucket, authentication profile 
 2. Choose the **Other** framework preset. No build command is required.
 3. Under **Project Settings → Environment Variables**, add:
 
-   - `OPENAI_API_KEY` — secret server-side OpenAI key.
-   - `OPENAI_MODEL` — optional; defaults to `gpt-4.1-mini`.
+   - `GROQ_API_KEY` — secret server-side Groq key.
+   - `GROQ_MODEL` — optional; defaults to `openai/gpt-oss-20b`.
    - `SUPABASE_URL` — your Supabase project URL.
    - `SUPABASE_ANON_KEY` — your publishable/anon key (not the service-role key).
 
@@ -48,4 +48,4 @@ The SQL creates the tables, private `recordings` bucket, authentication profile 
 
 Run `npm start` to preview the interface. Authentication, storage, and AI features require the environment variables and a Vercel-compatible `/api` runtime.
 
-Never place `OPENAI_API_KEY` or a Supabase service-role key in browser code.
+Never place `GROQ_API_KEY` or a Supabase service-role key in browser code.
